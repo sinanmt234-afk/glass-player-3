@@ -1,0 +1,284 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android project
+        run: |
+          mkdir -p lib
+          cp pubspec.yaml /tmp/pubspec.yaml
+          cp lib/main.dart /tmp/main.dart
+          flutter create --platforms=android --org com.aetherial --project-name glass_player .
+          cp /tmp/pubspec.yaml pubspec.yaml
+          cp /tmp/main.dart lib/main.dart
+
+      - name: Patch Android project
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re
+
+          root = pathlib.Path('.')
+
+          # ---------- AndroidManifest ----------
+          mp = root / 'android/app/src/main/AndroidManifest.xml'
+          s = mp.read_text()
+
+          perms = '''    <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+          '''
+
+          s = re.sub(r'android:label="[^"]*"', 'android:label="Glass Player"', s, count=1)
+          s = s.replace('<application', perms + '    <application android:usesCleartextTraffic="true"', 1)
+          s = s.replace('<activity', '<activity android:supportsPictureInPicture="true"', 1)
+
+          view_filter = '''
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW"/>
+                      <category android:name="android.intent.category.DEFAULT"/>
+                      <category android:name="android.intent.category.BROWSABLE"/>
+                      <data android:scheme="content"/>
+                      <data android:scheme="file"/>
+                      <data android:mimeType="video/*"/>
+                      <data android:mimeType="audio/*"/>
+                  </intent-filter>
+              '''
+          s = s.replace('</activity>', view_filter + '</activity>', 1)
+
+          service = '''
+              <service android:name="com.ryanheise.audioservice.AudioService"
+                  android:foregroundServiceType="mediaPlayback"
+                  android:exported="true">
+                  <intent-filter>
+                      <action android:name="android.media.browse.MediaBrowserService"/>
+                  </intent-filter>
+              </service>
+              <receiver android:name="com.ryanheise.audioservice.MediaButtonReceiver"
+                  android:exported="true">
+                  <intent-filter>
+                      <action android:name="android.intent.action.MEDIA_BUTTON"/>
+                  </intent-filter>
+              </receiver>
+          '''
+          s = s.replace('</application>', service + '</application>', 1)
+          mp.write_text(s)
+
+          # ---------- minSdk ----------
+          for g in (root / 'android/app').glob('build.gradle*'):
+              g.write_text(g.read_text().replace('flutter.minSdkVersion', '24'))
+
+          # ---------- MainActivity ----------
+          KOTLIN = '''package __PKG__
+
+          import android.Manifest
+          import android.app.PictureInPictureParams
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.res.Configuration
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.ParcelFileDescriptor
+          import android.provider.OpenableColumns
+          import android.util.Rational
+          import com.ryanheise.audioservice.AudioServiceActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : AudioServiceActivity() {
+              private var channel: MethodChannel? = null
+              private var pending: MethodChannel.Result? = null
+              private val fds = mutableListOf<ParcelFileDescriptor>()
+              private var autoPip = false
+              private var autoPipRatio = Rational(16, 9)
+
+              private fun describe(uri: Uri): Map<String, String>? {
+                  return try {
+                      val mime = contentResolver.getType(uri) ?: ""
+                      if (uri.scheme == "file") {
+                          mapOf("path" to (uri.path ?: ""), "name" to (uri.lastPathSegment ?: "media"), "mime" to mime)
+                      } else {
+                          val pfd = contentResolver.openFileDescriptor(uri, "r")
+                          if (pfd == null) {
+                              null
+                          } else {
+                              fds.add(pfd)
+                              var name = uri.lastPathSegment ?: "media"
+                              contentResolver.query(uri, null, null, null, null)?.use { c ->
+                                  val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                  if (i >= 0 && c.moveToFirst()) name = c.getString(i)
+                              }
+                              mapOf("path" to "/proc/self/fd/" + pfd.fd, "name" to name, "mime" to mime)
+                          }
+                      }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              private fun enterPip(r: Rational) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      try {
+                          enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(r).build())
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "glass/native")
+                  channel = ch
+                  ch.setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "initial" -> {
+                              val u = if (intent?.action == Intent.ACTION_VIEW) intent?.data else null
+                              if (u != null) intent = Intent()
+                              result.success(if (u != null) describe(u) else null)
+                          }
+                          "getBrightness" -> result.success(window.attributes.screenBrightness.toDouble())
+                          "setBrightness" -> {
+                              val v = (call.argument<Double>("v") ?: -1.0).toFloat()
+                              val lp = window.attributes
+                              lp.screenBrightness = v
+                              window.attributes = lp
+                              result.success(null)
+                          }
+                          "getVolume" -> {
+                              val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                              val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                              result.success(am.getStreamVolume(AudioManager.STREAM_MUSIC).toDouble() / max)
+                          }
+                          "setVolume" -> {
+                              val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                              val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                              val v = call.argument<Double>("v") ?: 0.5
+                              am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(v * max).toInt(), 0)
+                              result.success(null)
+                          }
+                          "pip" -> {
+                              val n = call.argument<Int>("num") ?: 16
+                              val d = call.argument<Int>("den") ?: 9
+                              enterPip(Rational(n, d))
+                              result.success(null)
+                          }
+                          "autoPip" -> {
+                              autoPip = call.argument<Boolean>("enabled") ?: false
+                              val n = call.argument<Int>("num") ?: 16
+                              val d = call.argument<Int>("den") ?: 9
+                              autoPipRatio = Rational(n, d)
+                              result.success(null)
+                          }
+                          "askNotif" -> {
+                              if (Build.VERSION.SDK_INT >= 33 &&
+                                  checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                                  requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 9)
+                              }
+                              result.success(null)
+                          }
+                          "pick" -> {
+                              pending = result
+                              val mimes = call.argument<List<String>>("mimes") ?: listOf("*/*")
+                              val multi = call.argument<Boolean>("multiple") ?: false
+                              val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                              i.addCategory(Intent.CATEGORY_OPENABLE)
+                              i.type = if (mimes.size == 1) mimes[0] else "*/*"
+                              if (mimes.size > 1) i.putExtra(Intent.EXTRA_MIME_TYPES, mimes.toTypedArray())
+                              i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multi)
+                              startActivityForResult(i, 77)
+                          }
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  if (requestCode == 77) {
+                      val out = mutableListOf<Map<String, String>>()
+                      if (resultCode == android.app.Activity.RESULT_OK && data != null) {
+                          val cd = data.clipData
+                          if (cd != null) {
+                              for (i in 0 until cd.itemCount) {
+                                  val m = describe(cd.getItemAt(i).uri)
+                                  if (m != null) out.add(m)
+                              }
+                          } else {
+                              val u = data.data
+                              if (u != null) {
+                                  val m = describe(u)
+                                  if (m != null) out.add(m)
+                              }
+                          }
+                      }
+                      pending?.success(out)
+                      pending = null
+                      return
+                  }
+                  super.onActivityResult(requestCode, resultCode, data)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  if (intent.action == Intent.ACTION_VIEW) {
+                      val u = intent.data
+                      if (u != null) {
+                          val m = describe(u)
+                          if (m != null) channel?.invokeMethod("newIntent", m)
+                      }
+                  }
+              }
+
+              override fun onUserLeaveHint() {
+                  super.onUserLeaveHint()
+                  if (autoPip) enterPip(autoPipRatio)
+              }
+
+              override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+                  super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+                  channel?.invokeMethod("pip", isInPictureInPictureMode)
+              }
+          }
+          '''
+
+          cands = list((root / 'android/app/src/main').rglob('MainActivity.*'))
+          first = cands[0]
+          pkg = re.search(r'^package\s+([\w.]+)', first.read_text(), re.M).group(1)
+          target = first.with_name('MainActivity.kt')
+          for c in cands:
+              c.unlink()
+          target.write_text(KOTLIN.replace('__PKG__', pkg))
+          print('Patched. package =', pkg)
+          PYEOF
+
+      - name: Build release APK
+        run: |
+          flutter pub get
+          flutter build apk --release --split-per-abi --no-shrink
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GlassPlayer-APK
+          path: build/app/outputs/flutter-apk/*.apk
